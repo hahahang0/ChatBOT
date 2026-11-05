@@ -39,14 +39,70 @@ function App() {
     });
   }, [messages, loading]);
 
-  async function sendMessage() {
+  // async function sendMessage() {
+  //   const content = input.trim();
+
+  //   if (!content || loading) return;
+
+  //   const userMessage: Message = {
+  //     role: "user",
+  //     content,
+  //   };
+
+  //   const conversation = [...messages, userMessage];
+
+  //   setMessages(conversation);
+  //   setInput("");
+  //   setError("");
+  //   setLoading(true);
+
+  //   try {
+  //     const response = await fetch(`${API_URL}/api/chat`, {
+  //       method: "POST",
+  //       headers: {
+  //         "Content-Type": "application/json",
+  //         Accept: "application/json",
+  //       },
+  //       body: JSON.stringify({
+  //         messages: conversation,
+  //       }),
+  //     });
+
+  //     const data = await response.json();
+
+  //     if (!response.ok) {
+  //       throw new Error(data.detail || "Something went wrong.");
+  //     }
+
+  //     const assistantMessage: Message = {
+  //       role: "assistant",
+  //       content: data.reply,
+  //     };
+
+  //     setMessages([...conversation, assistantMessage]);
+  //   } catch (err) {
+  //     setError(
+  //       err instanceof Error
+  //         ? err.message
+  //         : "Unable to connect to RoboResearch AI."
+  //     );
+  //   } finally {
+  //     setLoading(false);
+  //     textareaRef.current?.focus();
+  //   }
+  // }
+
+
+
+  
+async function sendMessage() {
     const content = input.trim();
 
     if (!content || loading) return;
 
     const userMessage: Message = {
-      role: "user",
-      content,
+        role: "user",
+        content,
     };
 
     const conversation = [...messages, userMessage];
@@ -56,41 +112,64 @@ function App() {
     setError("");
     setLoading(true);
 
+    const startedAt = performance.now();
+
+    console.log("[RoboResearch AI] Request started");
+
     try {
-      const response = await fetch(`${API_URL}/api/chat`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify({
-          messages: conversation,
-        }),
-      });
+        const response = await fetch(`${API_URL}/api/chat`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Accept: "application/json",
+            },
+            body: JSON.stringify({
+                messages: conversation,
+            }),
+        });
 
-      const data = await response.json();
+        console.log(
+            "[RoboResearch AI] HTTP response received:",
+            response.status,
+            "Elapsed:",
+            ((performance.now() - startedAt) / 1000).toFixed(2),
+            "seconds"
+        );
 
-      if (!response.ok) {
-        throw new Error(data.detail || "Something went wrong.");
-      }
+        const data = await response.json();
 
-      const assistantMessage: Message = {
-        role: "assistant",
-        content: data.reply,
-      };
+        if (!response.ok) {
+            throw new Error(data.detail || "Something went wrong.");
+        }
 
-      setMessages([...conversation, assistantMessage]);
+        const assistantMessage: Message = {
+            role: "assistant",
+            content: data.reply,
+        };
+
+        setMessages([...conversation, assistantMessage]);
+
+        console.log(
+            "[RoboResearch AI] Generation completed in",
+            ((performance.now() - startedAt) / 1000).toFixed(2),
+            "seconds"
+        );
+
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Unable to connect to RoboResearch AI."
-      );
+        console.error("[RoboResearch AI] Request failed:", err);
+
+        setError(
+            err instanceof Error
+                ? `${err.name}: ${err.message}`
+                : "Unable to connect to RoboResearch AI."
+        );
+
     } finally {
-      setLoading(false);
-      textareaRef.current?.focus();
+        setLoading(false);
+        textareaRef.current?.focus();
     }
-  }
+}
+  
 
   function newChat() {
     setMessages([]);
