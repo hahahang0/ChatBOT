@@ -1,28 +1,35 @@
+import json
 import time
+from contextlib import asynccontextmanager
 from typing import Literal
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+from app.database import (
+    init_db,
+    create_conversation,
+    get_all_conversations,
+    get_conversation,
+    save_message,
+    rename_conversation,
+    delete_conversation,
+)
+
 
 OLLAMA_URL = "http://localhost:11434"
 MODEL_NAME = "qwen3.5:2b"
 
 NUM_CTX = 6144
-NUM_PREDICT = 1024
+NUM_PREDICT = 1536
 TEMPERATURE = 0.2
 KEEP_ALIVE = "10m"
 HISTORY_LIMIT = 4
 
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
 
 SYSTEM_PROMPT = """
 You are RoboResearch AI, a friendly and knowledgeable educational
@@ -182,6 +189,19 @@ You are here to teach, explain, and help users learn.
 
 
 # ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("Initializing RoboResearch AI database...")
+    init_db()
+    print("SQLite database initialized successfully.")
+
+    yield
+
+
+# ============================================================
 # FASTAPI APPLICATION
 # ============================================================
 
@@ -189,12 +209,9 @@ app = FastAPI(
     title="RoboResearch AI",
     description="A personal robotics-focused educational AI assistant.",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
-
-# ============================================================
-# CORS CONFIGURATION
-# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -212,7 +229,6 @@ app.add_middleware(
 # REQUEST AND RESPONSE MODELS
 # ============================================================
 
-
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=12000)
@@ -220,6 +236,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1, max_length=40)
+    conversation_id: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -227,10 +244,49 @@ class ChatResponse(BaseModel):
     model: str
 
 
+class ConversationCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+
+
+class ConversationRename(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+
+
 # ============================================================
-# BASIC ROUTES
+# MESSAGE PERSISTENCE HELPER
 # ============================================================
 
+def prepare_user_message(request: ChatRequest):
+
+    if not request.conversation_id:
+        return
+
+    conversation = get_conversation(request.conversation_id)
+
+    if conversation is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found.",
+        )
+
+    latest_message = request.messages[-1]
+
+    if latest_message.role != "user":
+        raise HTTPException(
+            status_code=400,
+            detail="The latest message must be a user message.",
+        )
+
+    save_message(
+        request.conversation_id,
+        "user",
+        latest_message.content,
+    )
+
+
+# ============================================================
+# GENERAL ENDPOINTS
+# ============================================================
 
 @app.get("/")
 async def root():
@@ -247,14 +303,110 @@ async def health():
 
 
 # ============================================================
-# CHAT ENDPOINT
+# CONVERSATION MANAGEMENT ENDPOINTS
 # ============================================================
 
+@app.post("/api/conversations")
+async def create_new_conversation(request: ConversationCreate):
+
+    title = request.title.strip()
+
+    if not title:
+        raise HTTPException(
+            status_code=400,
+            detail="Conversation title cannot be empty.",
+        )
+
+    conversation_id = str(uuid4())
+
+    create_conversation(conversation_id, title)
+
+    return {
+        "id": conversation_id,
+        "title": title,
+        "message": "Conversation created successfully.",
+    }
+
+
+@app.get("/api/conversations")
+async def list_conversations():
+
+    conversations = get_all_conversations()
+
+    return {
+        "conversations": conversations,
+    }
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def load_conversation(conversation_id: str):
+
+    conversation = get_conversation(conversation_id)
+
+    if conversation is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found.",
+        )
+
+    return conversation
+
+
+@app.patch("/api/conversations/{conversation_id}")
+async def update_conversation_title(
+    conversation_id: str,
+    request: ConversationRename,
+):
+
+    title = request.title.strip()
+
+    if not title:
+        raise HTTPException(
+            status_code=400,
+            detail="Conversation title cannot be empty.",
+        )
+
+    updated = rename_conversation(conversation_id, title)
+
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found.",
+        )
+
+    return {
+        "id": conversation_id,
+        "title": title,
+        "message": "Conversation renamed successfully.",
+    }
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def remove_conversation(conversation_id: str):
+
+    deleted = delete_conversation(conversation_id)
+
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found.",
+        )
+
+    return {
+        "id": conversation_id,
+        "message": "Conversation deleted successfully.",
+    }
+
+
+# ============================================================
+# NON-STREAMING CHAT ENDPOINT
+# ============================================================
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
 
-    # Prepare conversation messages.
+    prepare_user_message(request)
+
     messages = [
         {
             "role": "system",
@@ -262,12 +414,9 @@ async def chat(request: ChatRequest):
         }
     ]
 
-    # Keep only the four most recent conversation messages.
     recent_messages = request.messages[-HISTORY_LIMIT:]
-
     messages.extend(message.model_dump() for message in recent_messages)
 
-    # Ollama API payload.
     payload = {
         "model": MODEL_NAME,
         "messages": messages,
@@ -282,8 +431,6 @@ async def chat(request: ChatRequest):
     }
 
     try:
-        # CPU-based generation may take several minutes.
-        # Therefore, there is no response-read timeout.
         timeout_config = httpx.Timeout(
             connect=10.0,
             read=None,
@@ -311,7 +458,6 @@ async def chat(request: ChatRequest):
 
         elapsed = time.perf_counter() - start_time
 
-        # Ollama diagnostics.
         print("\n========== OLLAMA DIAGNOSTICS ==========")
         print("Model:", result.get("model"))
         print("Done:", result.get("done"))
@@ -327,6 +473,13 @@ async def chat(request: ChatRequest):
             raise HTTPException(
                 status_code=502,
                 detail="The AI model returned an empty response.",
+            )
+
+        if request.conversation_id:
+            save_message(
+                request.conversation_id,
+                "assistant",
+                reply,
             )
 
         return ChatResponse(
@@ -357,3 +510,187 @@ async def chat(request: ChatRequest):
             status_code=502,
             detail="Ollama returned an invalid response.",
         )
+
+
+# ============================================================
+# STREAMING CHAT ENDPOINT
+# ============================================================
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest):
+
+    prepare_user_message(request)
+
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        }
+    ]
+
+    recent_messages = request.messages[-HISTORY_LIMIT:]
+    messages.extend(message.model_dump() for message in recent_messages)
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "stream": True,
+        "think": False,
+        "keep_alive": KEEP_ALIVE,
+        "options": {
+            "temperature": TEMPERATURE,
+            "num_ctx": NUM_CTX,
+            "num_predict": NUM_PREDICT,
+        },
+    }
+
+    async def generate():
+
+        timeout_config = httpx.Timeout(
+            connect=10.0,
+            read=None,
+            write=30.0,
+            pool=10.0,
+        )
+
+        start_time = time.perf_counter()
+
+        generated_tokens = 0
+        prompt_tokens = 0
+        finish_reason = None
+        full_reply = ""
+        stream_completed = False
+
+        print("\n========== OLLAMA STREAM REQUEST ==========")
+        print("Model:", MODEL_NAME)
+        print("Context size:", NUM_CTX)
+        print("Maximum output tokens:", NUM_PREDICT)
+        print("Conversation messages:", len(recent_messages))
+        print("Conversation ID:", request.conversation_id)
+        print("Starting generation...")
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout_config
+            ) as client:
+
+                async with client.stream(
+                    "POST",
+                    f"{OLLAMA_URL}/api/chat",
+                    json=payload,
+                ) as response:
+
+                    response.raise_for_status()
+
+                    async for line in response.aiter_lines():
+
+                        if not line:
+                            continue
+
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        content = (
+                            chunk.get("message", {})
+                            .get("content", "")
+                        )
+
+                        if content:
+                            full_reply += content
+
+                            yield json.dumps({
+                                "type": "token",
+                                "content": content,
+                            }) + "\n"
+
+                        if chunk.get("done"):
+                            stream_completed = True
+
+                            generated_tokens = chunk.get(
+                                "eval_count", 0
+                            )
+
+                            prompt_tokens = chunk.get(
+                                "prompt_eval_count", 0
+                            )
+
+                            finish_reason = chunk.get("done_reason")
+
+            elapsed = time.perf_counter() - start_time
+
+            print("\n========== OLLAMA STREAM DIAGNOSTICS ==========")
+            print("Model:", MODEL_NAME)
+            print("Finish reason:", finish_reason)
+            print("Generated tokens:", generated_tokens)
+            print("Prompt tokens:", prompt_tokens)
+            print(f"Generation time: {elapsed:.2f} seconds")
+            print("===============================================\n")
+
+            if not stream_completed:
+                yield json.dumps({
+                    "type": "error",
+                    "message": "The AI response was interrupted before completion.",
+                }) + "\n"
+                return
+
+            if not full_reply:
+                yield json.dumps({
+                    "type": "error",
+                    "message": "The AI model returned an empty response.",
+                }) + "\n"
+                return
+
+            # Save the complete assistant response only after
+            # Ollama has successfully finished generating it.
+
+            if request.conversation_id:
+                save_message(
+                    request.conversation_id,
+                    "assistant",
+                    full_reply,
+                )
+
+            yield json.dumps({
+                "type": "done",
+                "model": MODEL_NAME,
+                "finish_reason": finish_reason,
+                "eval_count": generated_tokens,
+                "prompt_eval_count": prompt_tokens,
+            }) + "\n"
+
+        except httpx.ConnectError:
+            yield json.dumps({
+                "type": "error",
+                "message": "Cannot connect to Ollama. Make sure Ollama is running.",
+            }) + "\n"
+
+        except httpx.TimeoutException:
+            yield json.dumps({
+                "type": "error",
+                "message": "The Ollama request timed out. Please try again.",
+            }) + "\n"
+
+        except httpx.HTTPStatusError as error:
+            yield json.dumps({
+                "type": "error",
+                "message": f"Ollama returned an error: {error.response.text[:500]}",
+            }) + "\n"
+
+        except Exception as error:
+            print("Streaming error:", repr(error))
+
+            yield json.dumps({
+                "type": "error",
+                "message": "An unexpected error occurred during generation.",
+            }) + "\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )

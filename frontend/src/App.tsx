@@ -1,3 +1,4 @@
+
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -14,11 +15,20 @@ import {
   Trash2,
   Sparkles,
   MessageSquare,
+  Pencil,
 } from "lucide-react";
 
 type Message = {
   role: "user" | "assistant";
   content: string;
+};
+
+type Conversation = {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
 };
 
 const API_URL = "http://127.0.0.1:8000";
@@ -30,8 +40,15 @@ function App() {
   const [error, setError] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(
+    null
+  );
+
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const controllerRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef(0);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({
@@ -39,142 +56,427 @@ function App() {
     });
   }, [messages, loading]);
 
-  // async function sendMessage() {
-  //   const content = input.trim();
-
-  //   if (!content || loading) return;
-
-  //   const userMessage: Message = {
-  //     role: "user",
-  //     content,
-  //   };
-
-  //   const conversation = [...messages, userMessage];
-
-  //   setMessages(conversation);
-  //   setInput("");
-  //   setError("");
-  //   setLoading(true);
-
+  // Fetch all saved conversations from SQLite.
+  // async function fetchConversations() {
   //   try {
-  //     const response = await fetch(`${API_URL}/api/chat`, {
-  //       method: "POST",
-  //       headers: {
-  //         "Content-Type": "application/json",
-  //         Accept: "application/json",
-  //       },
-  //       body: JSON.stringify({
-  //         messages: conversation,
-  //       }),
-  //     });
-
-  //     const data = await response.json();
+  //     const response = await fetch(`${API_URL}/api/conversations`);
 
   //     if (!response.ok) {
-  //       throw new Error(data.detail || "Something went wrong.");
+  //       throw new Error("Unable to load saved conversations.");
   //     }
 
-  //     const assistantMessage: Message = {
-  //       role: "assistant",
-  //       content: data.reply,
-  //     };
-
-  //     setMessages([...conversation, assistantMessage]);
+  //     const data: Conversation[] = await response.json();
+  //     setConversations(data);
   //   } catch (err) {
-  //     setError(
-  //       err instanceof Error
-  //         ? err.message
-  //         : "Unable to connect to RoboResearch AI."
-  //     );
-  //   } finally {
-  //     setLoading(false);
-  //     textareaRef.current?.focus();
+  //     console.error("[RoboResearch AI] Failed to load conversations:", err);
   //   }
   // }
 
 
-
   
-async function sendMessage() {
+async function fetchConversations() {
+  try {
+    const response = await fetch(`${API_URL}/api/conversations`);
+
+    if (!response.ok) {
+      throw new Error("Unable to load saved conversations.");
+    }
+
+    const data = await response.json();
+
+    setConversations(data.conversations ?? []);
+  } catch (err) {
+    console.error("[RoboResearch AI] Failed to load conversations:", err);
+  }
+}
+
+
+  // Load conversation history when the application opens.
+  useEffect(() => {
+    fetchConversations();
+  }, []);
+
+  // Cancel the current request before switching conversations.
+  function cancelActiveRequest() {
+    requestIdRef.current++;
+
+    controllerRef.current?.abort();
+    controllerRef.current = null;
+
+    setLoading(false);
+  }
+
+  // Generate a readable title from the first user message.
+  function generateConversationTitle(content: string) {
+    const cleaned = content.replace(/\s+/g, " ").trim();
+
+    if (cleaned.length <= 55) {
+      return cleaned;
+    }
+
+    return cleaned.slice(0, 55).trimEnd() + "...";
+  }
+
+  // Create a new conversation in the backend.
+  async function createConversation(title: string, signal: AbortSignal) {
+    const response = await fetch(`${API_URL}/api/conversations`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ title }),
+      signal,
+    });
+
+    if (!response.ok) {
+      let message = "Unable to create a new conversation.";
+
+      try {
+        const data = await response.json();
+        message = data.detail || message;
+      } catch {
+        // Keep default error.
+      }
+
+      throw new Error(message);
+    }
+
+    return response.json();
+  }
+
+  // Open an existing conversation.
+  async function openConversation(conversationId: string) {
+    if (conversationId === activeConversationId && !loading) {
+      return;
+    }
+
+    cancelActiveRequest();
+
+    const requestId = requestIdRef.current;
+    const controller = new AbortController();
+
+    controllerRef.current = controller;
+
+    setLoading(true);
+    setError("");
+
+    try {
+      const response = await fetch(
+        `${API_URL}/api/conversations/${conversationId}`,
+        {
+          signal: controller.signal,
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error("Unable to open this conversation.");
+      }
+
+      const data = await response.json();
+
+      if (requestId !== requestIdRef.current) return;
+
+      const restoredMessages: Message[] = data.messages.map(
+        (message: Message) => ({
+          role: message.role,
+          content: message.content,
+        })
+      );
+
+      setMessages(restoredMessages);
+      setActiveConversationId(conversationId);
+
+      textareaRef.current?.focus();
+    } catch (err) {
+      if (controller.signal.aborted) return;
+
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to load this conversation."
+      );
+    } finally {
+      if (requestId === requestIdRef.current) {
+        setLoading(false);
+        controllerRef.current = null;
+      }
+    }
+  }
+
+  // Rename an existing conversation.
+  async function renameConversation(conversation: Conversation) {
+    const newTitle = window.prompt(
+      "Enter a new conversation title:",
+      conversation.title
+    );
+
+    if (!newTitle || !newTitle.trim()) return;
+
+    try {
+      const response = await fetch(
+        `${API_URL}/api/conversations/${conversation.id}`,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            title: newTitle.trim(),
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error("Unable to rename this conversation.");
+      }
+
+      await fetchConversations();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to rename this conversation."
+      );
+    }
+  }
+
+  // Delete a conversation permanently.
+  async function deleteConversation(conversationId: string) {
+    const confirmed = window.confirm(
+      "Are you sure you want to delete this conversation? This action cannot be undone."
+    );
+
+    if (!confirmed) return;
+
+    try {
+      const response = await fetch(
+        `${API_URL}/api/conversations/${conversationId}`,
+        {
+          method: "DELETE",
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error("Unable to delete this conversation.");
+      }
+
+      if (activeConversationId === conversationId) {
+        cancelActiveRequest();
+        setMessages([]);
+        setActiveConversationId(null);
+        setInput("");
+      }
+
+      await fetchConversations();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to delete this conversation."
+      );
+    }
+  }
+
+  async function sendMessage() {
     const content = input.trim();
 
     if (!content || loading) return;
 
     const userMessage: Message = {
-        role: "user",
-        content,
+      role: "user",
+      content,
     };
 
     const conversation = [...messages, userMessage];
+    const assistantIndex = conversation.length;
 
-    setMessages(conversation);
+    const requestId = ++requestIdRef.current;
+    const controller = new AbortController();
+
+    controllerRef.current = controller;
+
     setInput("");
     setError("");
     setLoading(true);
 
     const startedAt = performance.now();
 
-    console.log("[RoboResearch AI] Request started");
+    console.log("[RoboResearch AI] Streaming request started");
 
     try {
-        const response = await fetch(`${API_URL}/api/chat`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Accept: "application/json",
-            },
-            body: JSON.stringify({
-                messages: conversation,
-            }),
-        });
+      // Create a database conversation only when the first message is sent.
+      let conversationId = activeConversationId;
 
-        console.log(
-            "[RoboResearch AI] HTTP response received:",
-            response.status,
-            "Elapsed:",
-            ((performance.now() - startedAt) / 1000).toFixed(2),
-            "seconds"
+      if (!conversationId) {
+        const created = await createConversation(
+          generateConversationTitle(content),
+          controller.signal
         );
 
-        const data = await response.json();
+        if (requestId !== requestIdRef.current) return;
 
-        if (!response.ok) {
-            throw new Error(data.detail || "Something went wrong.");
+        conversationId = created.id;
+
+        if (!conversationId) {
+          throw new Error("The backend did not return a conversation ID.");
         }
 
-        const assistantMessage: Message = {
-            role: "assistant",
-            content: data.reply,
-        };
+        setActiveConversationId(conversationId);
+        void fetchConversations();
+      }
 
-        setMessages([...conversation, assistantMessage]);
+      if (requestId !== requestIdRef.current) return;
 
-        console.log(
+      // Add the user message and an empty assistant response.
+      setMessages([
+        ...conversation,
+        {
+          role: "assistant",
+          content: "",
+        },
+      ]);
+
+      const response = await fetch(`${API_URL}/api/chat/stream`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/x-ndjson",
+        },
+        body: JSON.stringify({
+          conversation_id: conversationId,
+          messages: conversation,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        let errorMessage = "Something went wrong.";
+
+        try {
+          const data = await response.json();
+          errorMessage = data.detail || errorMessage;
+        } catch {
+          // Keep default error.
+        }
+
+        throw new Error(errorMessage);
+      }
+
+      if (!response.body) {
+        throw new Error("Streaming is not supported by this response.");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      let buffer = "";
+      let receivedDone = false;
+
+      // Process one NDJSON event.
+      function processEvent(line: string) {
+        if (!line.trim()) return;
+
+        const event = JSON.parse(line);
+
+        if (event.type === "token") {
+          if (requestId !== requestIdRef.current) return;
+
+          setMessages((previous) =>
+            previous.map((message, index) =>
+              index === assistantIndex
+                ? {
+                    ...message,
+                    content: message.content + event.content,
+                  }
+                : message
+            )
+          );
+        }
+
+        if (event.type === "done") {
+          receivedDone = true;
+
+          console.log(
             "[RoboResearch AI] Generation completed in",
             ((performance.now() - startedAt) / 1000).toFixed(2),
             "seconds"
-        );
+          );
 
+          console.log("[RoboResearch AI] Model:", event.model);
+          console.log("[RoboResearch AI] Finish reason:", event.finish_reason);
+          console.log("[RoboResearch AI] Generated tokens:", event.eval_count);
+          console.log("[RoboResearch AI] Prompt tokens:", event.prompt_eval_count);
+        }
+
+        if (event.type === "error") {
+          throw new Error(event.message || "Streaming failed.");
+        }
+      }
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+
+          if (done) break;
+
+          if (requestId !== requestIdRef.current) break;
+
+          buffer += decoder.decode(value, { stream: true });
+
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            processEvent(line);
+          }
+        }
+
+        // Process any remaining data after the stream closes.
+        buffer += decoder.decode();
+
+        if (buffer.trim() && requestId === requestIdRef.current) {
+          processEvent(buffer);
+        }
+
+        if (!receivedDone && requestId === requestIdRef.current) {
+          throw new Error(
+            "The response ended before generation completed."
+          );
+        }
+      } finally {
+        reader.releaseLock();
+      }
+
+      if (receivedDone && requestId === requestIdRef.current) {
+        void fetchConversations();
+      }
     } catch (err) {
-        console.error("[RoboResearch AI] Request failed:", err);
+      if (controller.signal.aborted) return;
 
-        setError(
-            err instanceof Error
-                ? `${err.name}: ${err.message}`
-                : "Unable to connect to RoboResearch AI."
-        );
+      console.error("[RoboResearch AI] Streaming failed:", err);
 
+      setError(
+        err instanceof Error
+          ? `${err.name}: ${err.message}`
+          : "Unable to connect to RoboResearch AI."
+      );
     } finally {
+      if (requestId === requestIdRef.current) {
         setLoading(false);
+        controllerRef.current = null;
         textareaRef.current?.focus();
+      }
     }
-}
-  
+  }
 
   function newChat() {
+    cancelActiveRequest();
+
     setMessages([]);
+    setActiveConversationId(null);
     setInput("");
     setError("");
+
     textareaRef.current?.focus();
   }
 
@@ -187,8 +489,6 @@ async function sendMessage() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-zinc-950 text-zinc-100">
-
-      {/* Sidebar */}
       <aside
         className={`${
           sidebarOpen ? "flex" : "hidden"
@@ -215,23 +515,51 @@ async function sendMessage() {
           New chat
         </button>
 
-        <div className="mt-8">
+        <div className="mt-8 min-h-0 flex-1 overflow-y-auto">
           <p className="mb-3 px-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
             Conversations
           </p>
 
-          {messages.length > 0 ? (
-            <div className="flex items-center gap-2 rounded-lg bg-zinc-800 px-3 py-3 text-sm">
-              <MessageSquare size={16} />
-              <span className="truncate">Current conversation</span>
+          {conversations.length > 0 ? (
+            <div className="space-y-2">
+              {conversations.map((conversation) => (
+                <div
+                  key={conversation.id}
+                  className={`group flex items-center gap-2 rounded-lg px-3 py-3 text-sm transition ${
+                    activeConversationId === conversation.id
+                      ? "bg-zinc-800 text-white"
+                      : "text-zinc-400 hover:bg-zinc-800/70 hover:text-white"
+                  }`}
+                >
+                  <button
+                    onClick={() => openConversation(conversation.id)}
+                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                    title={conversation.title}
+                  >
+                    <MessageSquare size={16} className="shrink-0" />
 
-              <button
-                onClick={newChat}
-                className="ml-auto text-zinc-500 hover:text-red-400"
-                title="Clear conversation"
-              >
-                <Trash2 size={15} />
-              </button>
+                    <span className="truncate">
+                      {conversation.title}
+                    </span>
+                  </button>
+
+                  <button
+                    onClick={() => renameConversation(conversation)}
+                    className="shrink-0 text-zinc-500 opacity-0 transition hover:text-blue-400 group-hover:opacity-100"
+                    title="Rename conversation"
+                  >
+                    <Pencil size={14} />
+                  </button>
+
+                  <button
+                    onClick={() => deleteConversation(conversation.id)}
+                    className="shrink-0 text-zinc-500 opacity-0 transition hover:text-red-400 group-hover:opacity-100"
+                    title="Delete conversation"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
             </div>
           ) : (
             <p className="px-2 text-sm text-zinc-600">
@@ -240,7 +568,7 @@ async function sendMessage() {
           )}
         </div>
 
-        <div className="mt-auto rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+        <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-950 p-4">
           <div className="mb-2 flex items-center gap-2 text-sm">
             <Sparkles size={16} className="text-blue-400" />
             Local AI
@@ -253,10 +581,7 @@ async function sendMessage() {
         </div>
       </aside>
 
-      {/* Main area */}
       <main className="flex min-w-0 flex-1 flex-col">
-
-        {/* Header */}
         <header className="flex h-16 shrink-0 items-center justify-between border-b border-zinc-800 px-5">
           <div className="flex items-center gap-3">
             <button
@@ -282,10 +607,8 @@ async function sendMessage() {
           </div>
         </header>
 
-        {/* Messages */}
         <section className="flex-1 overflow-y-auto px-4 py-8">
           <div className="mx-auto max-w-3xl">
-
             {messages.length === 0 ? (
               <div className="flex min-h-[60vh] flex-col items-center justify-center text-center">
                 <div className="mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-blue-600/15 text-blue-400">
@@ -345,28 +668,22 @@ async function sendMessage() {
                       </p>
 
                       <div className="markdown-content text-sm leading-7 text-zinc-300">
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm, remarkMath]}
-                    rehypePlugins={[rehypeKatex, rehypeHighlight]}
-                  >
-                    {message.content}
-                  </ReactMarkdown>
-                </div>
-                                    </div>
+                        {message.content ? (
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm, remarkMath]}
+                            rehypePlugins={[rehypeKatex, rehypeHighlight]}
+                          >
+                            {message.content}
+                          </ReactMarkdown>
+                        ) : loading && index === messages.length - 1 ? (
+                          <span className="text-zinc-400">
+                            Thinking...
+                          </span>
+                        ) : null}
+                      </div>
+                    </div>
                   </div>
                 ))}
-
-                {loading && (
-                  <div className="flex gap-4">
-                    <div className="flex h-9 w-9 items-center justify-center rounded-full bg-blue-600">
-                      <Bot size={19} />
-                    </div>
-
-                    <div className="pt-2 text-sm text-zinc-400">
-                      Thinking...
-                    </div>
-                  </div>
-                )}
 
                 <div ref={bottomRef} />
               </div>
@@ -380,7 +697,6 @@ async function sendMessage() {
           </div>
         </section>
 
-        {/* Input */}
         <footer className="shrink-0 px-4 pb-6 pt-3">
           <div className="mx-auto max-w-3xl">
             <div className="rounded-2xl border border-zinc-700 bg-zinc-900 p-3 shadow-lg focus-within:border-zinc-500">
