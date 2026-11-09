@@ -1,3 +1,4 @@
+
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -56,6 +57,7 @@ type Message = {
   role: "user" | "assistant";
   content: string;
   sources?: Source[];
+  truncated?: boolean;
 };
 
 type Conversation = {
@@ -80,6 +82,7 @@ type StreamEvent = {
   eval_count?: number;
   prompt_eval_count?: number;
   sources?: Source[];
+  truncated?: boolean;
 };
 
 // --------------------------------------------------
@@ -90,11 +93,8 @@ const API_URL = (
   import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"
 ).replace(/\/$/, "");
 
-// Default Groq model.
-// The backend's /api/models response can override this.
 const DEFAULT_MODEL = "openai/gpt-oss-120b";
 
-// Exclude embedding models from the chat model selector.
 function isEmbeddingModel(model: string) {
   return /embed|all-minilm|nomic-embed|mxbai|bge-|snowflake-arctic/i.test(
     model
@@ -105,18 +105,6 @@ function isEmbeddingModel(model: string) {
 // STREAMING JSON PARSER
 // --------------------------------------------------
 
-/**
- * Parses one or more JSON objects from a string.
- *
- * Supports:
- * - Normal NDJSON events
- * - Multiple concatenated JSON objects
- * - SSE data: prefixes
- * - [DONE] markers
- *
- * This avoids JSON.parse errors when multiple events
- * arrive together in the same network chunk.
- */
 function parseStreamEvents(rawLine: string): StreamEvent[] {
   let line = rawLine.trim();
 
@@ -124,7 +112,6 @@ function parseStreamEvents(rawLine: string): StreamEvent[] {
     return [];
   }
 
-  // Support Server-Sent Events.
   if (line.startsWith("data:")) {
     line = line.slice(5).trim();
   }
@@ -173,15 +160,16 @@ function parseStreamEvents(rawLine: string): StreamEvent[] {
       depth--;
 
       if (depth < 0) {
-        throw new Error("Invalid streaming JSON: unexpected closing brace.");
+        throw new Error(
+          "Invalid streaming JSON: unexpected closing brace."
+        );
       }
 
       if (depth === 0 && start !== -1) {
         const jsonText = line.slice(start, i + 1);
 
         try {
-          const event = JSON.parse(jsonText) as StreamEvent;
-          events.push(event);
+          events.push(JSON.parse(jsonText) as StreamEvent);
         } catch {
           throw new Error(
             "Unable to parse a streaming event from the server."
@@ -199,7 +187,6 @@ function parseStreamEvents(rawLine: string): StreamEvent[] {
     );
   }
 
-  // If there were no JSON objects, the response may be unexpected text.
   if (events.length === 0 && line.length > 0) {
     throw new Error(
       `Unexpected streaming response: ${line.slice(0, 120)}`
@@ -353,9 +340,7 @@ function App() {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        title,
-      }),
+      body: JSON.stringify({ title }),
       signal,
     });
 
@@ -396,6 +381,7 @@ function App() {
 
     setLoading(true);
     setError("");
+    setAttachedDocument(null);
 
     try {
       const response = await fetch(
@@ -555,49 +541,104 @@ function App() {
   }
 
   // ------------------------------------------------
-  // ATTACH PDF TO CHAT
+  // SELECT A LIBRARY DOCUMENT FOR CHAT
   // ------------------------------------------------
 
-  async function attachDocumentToChat(file: File) {
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
-      setDocumentError("Please select a PDF file.");
+  function selectDocumentForChat(document: Document) {
+    if (document.status !== "ready") {
+      setDocumentError(
+        "This PDF is not ready yet. Please wait until processing is complete."
+      );
       return;
     }
 
+    setAttachedDocument(document);
+    setDocumentError("");
+
+    textareaRef.current?.focus();
+
+    console.log(
+      "[RoboResearch AI] Document selected for chat:",
+      document.id,
+      document.filename
+    );
+  }
+
+  // ------------------------------------------------
+  // UPLOAD PDF AND RETURN DOCUMENT DETAILS
+  // ------------------------------------------------
+
+  async function uploadPdf(file: File): Promise<Document> {
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      throw new Error("Please select a PDF file.");
+    }
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const response = await fetch(
+      `${API_URL}/api/documents/upload`,
+      {
+        method: "POST",
+        body: formData,
+      }
+    );
+
+    let data: {
+      document?: Document;
+      detail?: string;
+    };
+
+    try {
+      data = await response.json();
+    } catch {
+      throw new Error(
+        "The server returned an invalid upload response."
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        data.detail || "Unable to upload this document."
+      );
+    }
+
+    if (!data.document?.id) {
+      throw new Error(
+        "The server uploaded the PDF but did not return a valid document ID."
+      );
+    }
+
+    return data.document;
+  }
+
+  // ------------------------------------------------
+  // ATTACH PDF DIRECTLY TO CHAT
+  // ------------------------------------------------
+
+  async function attachDocumentToChat(file: File) {
     setUploading(true);
     setDocumentError("");
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
+      const uploaded = await uploadPdf(file);
 
-      const response = await fetch(
-        `${API_URL}/api/documents/upload`,
-        {
-          method: "POST",
-          body: formData,
-        }
-      );
-
-      const data = await response.json();
-
-      if (!response.ok) {
+      if (uploaded.status !== "ready") {
         throw new Error(
-          data.detail || "Unable to upload this document."
-        );
-      }
-
-      const uploaded = data.document as Document | undefined;
-
-      if (!uploaded) {
-        throw new Error(
-          "The server uploaded the PDF but did not return document details."
+          uploaded.error_message ||
+            "The PDF has not finished processing."
         );
       }
 
       setAttachedDocument(uploaded);
 
       await fetchDocuments();
+
+      console.log(
+        "[RoboResearch AI] PDF attached to chat:",
+        uploaded.id,
+        uploaded.filename
+      );
     } catch (err) {
       setDocumentError(
         err instanceof Error
@@ -618,31 +659,27 @@ function App() {
   // ------------------------------------------------
 
   async function uploadDocument(file: File) {
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
-      setDocumentError("Please select a PDF file.");
-      return;
-    }
-
     setUploading(true);
     setDocumentError("");
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
+      const uploaded = await uploadPdf(file);
 
-      const response = await fetch(
-        `${API_URL}/api/documents/upload`,
-        {
-          method: "POST",
-          body: formData,
-        }
-      );
+      // IMPORTANT:
+      // A PDF uploaded through the Research Library
+      // is now also attached to the current chat.
+      if (uploaded.status === "ready") {
+        setAttachedDocument(uploaded);
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          data.detail || "Unable to upload this document."
+        console.log(
+          "[RoboResearch AI] Library PDF automatically attached:",
+          uploaded.id,
+          uploaded.filename
+        );
+      } else {
+        setDocumentError(
+          uploaded.error_message ||
+            "The PDF was uploaded but is not ready for chat yet."
         );
       }
 
@@ -777,7 +814,6 @@ function App() {
       return false;
     }
 
-    // TOKEN EVENT
     if (event.type === "token") {
       setMessages((previous) =>
         previous.map((message, index) =>
@@ -793,7 +829,6 @@ function App() {
       return false;
     }
 
-    // DONE EVENT
     if (event.type === "done") {
       console.log(
         "[RoboResearch AI] Generation completed in",
@@ -821,16 +856,27 @@ function App() {
         ? event.sources
         : [];
 
+      const wasTruncated =
+        event.truncated === true ||
+        event.finish_reason === "length";
+
       setMessages((previous) =>
         previous.map((message, index) =>
           index === assistantIndex
             ? {
                 ...message,
                 sources: receivedSources,
+                truncated: wasTruncated,
               }
             : message
         )
       );
+
+      if (wasTruncated) {
+        console.warn(
+          "[RoboResearch AI] Response reached the output token limit."
+        );
+      }
 
       console.log(
         "[RoboResearch AI] Retrieved sources:",
@@ -840,7 +886,6 @@ function App() {
       return true;
     }
 
-    // ERROR EVENT
     if (event.type === "error") {
       throw new Error(event.message || "Streaming failed.");
     }
@@ -873,6 +918,18 @@ function App() {
       return;
     }
 
+    if (
+      attachedDocument &&
+      attachedDocument.status !== "ready"
+    ) {
+      setError(
+        "The attached PDF is not ready yet. Please wait for processing to finish."
+      );
+      return;
+    }
+
+    const selectedDocument = attachedDocument;
+
     const userMessage: Message = {
       role: "user",
       content,
@@ -894,10 +951,16 @@ function App() {
 
     console.log("[RoboResearch AI] Streaming request started");
     console.log("[RoboResearch AI] Selected model:", selectedModel);
+    console.log(
+      "[RoboResearch AI] Attached document ID:",
+      selectedDocument?.id ?? "None"
+    );
+    console.log(
+      "[RoboResearch AI] Attached document:",
+      selectedDocument?.filename ?? "None"
+    );
 
     try {
-      // Create a database conversation only when
-      // the first message is sent.
       let conversationId = activeConversationId;
 
       if (!conversationId) {
@@ -927,17 +990,31 @@ function App() {
         return;
       }
 
-      // Add user message and empty assistant response.
       setMessages([
         ...conversation,
         {
           role: "assistant",
           content: "",
           sources: [],
+          truncated: false,
         },
       ]);
 
-      // Start streaming request.
+      const requestBody = {
+        conversation_id: conversationId,
+        messages: conversation,
+        model: selectedModel,
+
+        // The selected PDF ID is explicitly sent
+        // with every chat request.
+        document_id: selectedDocument?.id ?? null,
+      };
+
+      console.log(
+        "[RoboResearch AI] Sending document_id:",
+        requestBody.document_id
+      );
+
       const response = await fetch(
         `${API_URL}/api/chat/stream`,
         {
@@ -946,14 +1023,7 @@ function App() {
             "Content-Type": "application/json",
             Accept: "application/x-ndjson",
           },
-          body: JSON.stringify({
-      conversation_id: conversationId,
-      messages: conversation,
-      model: selectedModel,
-
-      // Send the ID of the attached PDF to the backend.
-      document_id: attachedDocument?.id ?? null,
-      }),
+          body: JSON.stringify(requestBody),
           signal: controller.signal,
         }
       );
@@ -983,7 +1053,6 @@ function App() {
       let buffer = "";
       let receivedDone = false;
 
-      // Process a complete line from the stream.
       function processLine(line: string) {
         const events = parseStreamEvents(line);
 
@@ -1017,10 +1086,7 @@ function App() {
             stream: true,
           });
 
-          // Process complete lines.
           const lines = buffer.split(/\r?\n/);
-
-          // Keep the unfinished line for the next chunk.
           buffer = lines.pop() ?? "";
 
           for (const line of lines) {
@@ -1032,10 +1098,8 @@ function App() {
           }
         }
 
-        // Flush any remaining decoder data.
         buffer += decoder.decode();
 
-        // Process any remaining content after stream closes.
         if (
           buffer.trim() &&
           requestId === requestIdRef.current
@@ -1055,12 +1119,13 @@ function App() {
         reader.releaseLock();
       }
 
-      // Refresh conversation list after successful completion.
       if (
         receivedDone &&
         requestId === requestIdRef.current
       ) {
+        // Detach after a successful response.
         setAttachedDocument(null);
+
         void fetchConversations();
       }
     } catch (err) {
@@ -1100,6 +1165,7 @@ function App() {
     setInput("");
     setError("");
     setAttachedDocument(null);
+    setDocumentError("");
 
     textareaRef.current?.focus();
   }
@@ -1281,78 +1347,109 @@ function App() {
 
           {documents.length > 0 ? (
             <div className="space-y-2">
-              {documents.map((document) => (
-                <div
-                  key={document.id}
-                  className="group rounded-lg border border-zinc-800 bg-zinc-950/60 p-3"
-                >
-                  <div className="flex items-start gap-2">
-                    <FileText
-                      size={17}
-                      className="mt-0.5 shrink-0 text-blue-400"
-                    />
+              {documents.map((document) => {
+                const isAttached =
+                  attachedDocument?.id === document.id;
 
-                    <div className="min-w-0 flex-1">
-                      <p
-                        className="truncate text-xs font-medium text-zinc-300"
-                        title={document.filename}
-                      >
-                        {document.filename}
-                      </p>
+                return (
+                  <div
+                    key={document.id}
+                    className={`group rounded-lg border p-3 ${
+                      isAttached
+                        ? "border-blue-700/70 bg-blue-950/20"
+                        : "border-zinc-800 bg-zinc-950/60"
+                    }`}
+                  >
+                    <div className="flex items-start gap-2">
+                      <FileText
+                        size={17}
+                        className="mt-0.5 shrink-0 text-blue-400"
+                      />
 
-                      <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                        {document.status === "ready" && (
-                          <span className="flex items-center gap-1 text-emerald-400">
-                            <CheckCircle2 size={12} />
-                            Ready
+                      <div className="min-w-0 flex-1">
+                        <p
+                          className="truncate text-xs font-medium text-zinc-300"
+                          title={document.filename}
+                        >
+                          {document.filename}
+                        </p>
+
+                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                          {document.status === "ready" && (
+                            <span className="flex items-center gap-1 text-emerald-400">
+                              <CheckCircle2 size={12} />
+                              Ready
+                            </span>
+                          )}
+
+                          {document.status === "processing" && (
+                            <span className="flex items-center gap-1 text-amber-400">
+                              <LoaderCircle
+                                size={12}
+                                className="animate-spin"
+                              />
+                              Processing
+                            </span>
+                          )}
+
+                          {document.status === "failed" && (
+                            <span
+                              className="flex items-center gap-1 text-red-400"
+                              title={
+                                document.error_message ||
+                                "Processing failed"
+                              }
+                            >
+                              <AlertCircle size={12} />
+                              Failed
+                            </span>
+                          )}
+
+                          <span className="text-zinc-600">
+                            {formatFileSize(document.file_size)}
                           </span>
-                        )}
 
-                        {document.status === "processing" && (
-                          <span className="flex items-center gap-1 text-amber-400">
-                            <LoaderCircle
-                              size={12}
-                              className="animate-spin"
-                            />
-                            Processing
+                          <span className="text-zinc-600">
+                            {document.page_count} pages
                           </span>
-                        )}
+                        </div>
 
-                        {document.status === "failed" && (
-                          <span
-                            className="flex items-center gap-1 text-red-400"
-                            title={
-                              document.error_message ||
-                              "Processing failed"
-                            }
-                          >
-                            <AlertCircle size={12} />
-                            Failed
-                          </span>
-                        )}
-
-                        <span className="text-zinc-600">
-                          {formatFileSize(document.file_size)}
-                        </span>
-
-                        <span className="text-zinc-600">
-                          {document.page_count} pages
-                        </span>
+                        {/* SELECT DOCUMENT FOR CHAT */}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            selectDocumentForChat(document)
+                          }
+                          disabled={
+                            document.status !== "ready" ||
+                            uploading ||
+                            loading
+                          }
+                          className={`mt-3 rounded-md px-2.5 py-1.5 text-xs transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                            isAttached
+                              ? "bg-blue-600/20 text-blue-300"
+                              : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white"
+                          }`}
+                        >
+                          {isAttached
+                            ? "Selected for chat"
+                            : "Use in chat"}
+                        </button>
                       </div>
-                    </div>
 
-                    <button
-                      onClick={() =>
-                        void deleteDocument(document.id)
-                      }
-                      className="shrink-0 text-zinc-600 opacity-0 transition hover:text-red-400 group-hover:opacity-100"
-                      title="Delete document"
-                    >
-                      <Trash2 size={14} />
-                    </button>
+                      <button
+                        onClick={() =>
+                          void deleteDocument(document.id)
+                        }
+                        className="shrink-0 text-zinc-600 opacity-0 transition hover:text-red-400 group-hover:opacity-100"
+                        title="Delete document"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           ) : (
             <p className="px-2 py-3 text-center text-xs text-zinc-600">
@@ -1525,7 +1622,6 @@ function App() {
                     key={index}
                     className="flex gap-4"
                   >
-                    {/* AVATAR */}
                     <div
                       className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${
                         message.role === "assistant"
@@ -1540,7 +1636,6 @@ function App() {
                       )}
                     </div>
 
-                    {/* MESSAGE CONTENT */}
                     <div className="min-w-0 flex-1 pt-1">
                       <p className="mb-2 text-sm font-semibold">
                         {message.role === "assistant"
@@ -1569,6 +1664,30 @@ function App() {
                           </span>
                         ) : null}
                       </div>
+
+                      {/* TRUNCATION WARNING */}
+                      {message.role === "assistant" &&
+                        message.truncated && (
+                          <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-800/60 bg-amber-950/30 p-3 text-xs leading-relaxed text-amber-300">
+                            <AlertCircle
+                              size={16}
+                              className="mt-0.5 shrink-0"
+                            />
+
+                            <div>
+                              <p className="font-semibold">
+                                Response may be incomplete
+                              </p>
+
+                              <p className="mt-1 text-amber-400/80">
+                                The model reached its maximum output
+                                token limit before finishing its answer.
+                                Ask it to continue or request a shorter
+                                response.
+                              </p>
+                            </div>
+                          </div>
+                        )}
 
                       {/* RETRIEVED SOURCES */}
                       {message.role === "assistant" &&
