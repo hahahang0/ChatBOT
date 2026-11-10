@@ -321,7 +321,7 @@ function App() {
       setConversations(data.conversations ?? []);
     } catch (err) {
       console.error(
-        "[RoboResearch AI] Failed to load conversations:",
+        "[Robo Research] Failed to load conversations:",
         err
       );
     }
@@ -534,7 +534,7 @@ function App() {
       setDocuments(data.documents ?? []);
     } catch (err) {
       console.error(
-        "[RoboResearch AI] Failed to load documents:",
+        "[Robo Research] Failed to load documents:",
         err
       );
     }
@@ -557,11 +557,11 @@ function App() {
 
     textareaRef.current?.focus();
 
-    console.log(
-      "[RoboResearch AI] Document selected for chat:",
-      document.id,
-      document.filename
-    );
+    // console.log(
+    //   "[Robo Research] Document selected for chat:",
+    //   document.id,
+    //   document.filename
+    // );
   }
 
   // ------------------------------------------------
@@ -634,11 +634,11 @@ function App() {
 
       await fetchDocuments();
 
-      console.log(
-        "[RoboResearch AI] PDF attached to chat:",
-        uploaded.id,
-        uploaded.filename
-      );
+      // console.log(
+      //   "[Robo Research] PDF attached to chat:",
+      //   uploaded.id,
+      //   uploaded.filename
+      // );
     } catch (err) {
       setDocumentError(
         err instanceof Error
@@ -671,11 +671,11 @@ function App() {
       if (uploaded.status === "ready") {
         setAttachedDocument(uploaded);
 
-        console.log(
-          "[RoboResearch AI] Library PDF automatically attached:",
-          uploaded.id,
-          uploaded.filename
-        );
+        // console.log(
+        //   "[RoboResearch AI] Library PDF automatically attached:",
+        //   uploaded.id,
+        //   uploaded.filename
+        // );
       } else {
         setDocumentError(
           uploaded.error_message ||
@@ -830,25 +830,25 @@ function App() {
     }
 
     if (event.type === "done") {
-      console.log(
-        "[RoboResearch AI] Generation completed in",
-        ((performance.now() - startedAt) / 1000).toFixed(2),
-        "seconds"
-      );
+      // console.log(
+      //   "[RoboResearch AI] Generation completed in",
+      //   ((performance.now() - startedAt) / 1000).toFixed(2),
+      //   "seconds"
+      // );
 
-      console.log("[RoboResearch AI] Model:", event.model);
-      console.log(
-        "[RoboResearch AI] Finish reason:",
-        event.finish_reason
-      );
-      console.log(
-        "[RoboResearch AI] Generated tokens:",
-        event.eval_count
-      );
-      console.log(
-        "[RoboResearch AI] Prompt tokens:",
-        event.prompt_eval_count
-      );
+      // console.log("[RoboResearch AI] Model:", event.model);
+      // console.log(
+      //   "[RoboResearch AI] Finish reason:",
+      //   event.finish_reason
+      // );
+      // console.log(
+      //   "[RoboResearch AI] Generated tokens:",
+      //   event.eval_count
+      // );
+      // console.log(
+      //   "[RoboResearch AI] Prompt tokens:",
+      //   event.prompt_eval_count
+      // );
 
       const receivedSources: Source[] = Array.isArray(
         event.sources
@@ -878,10 +878,10 @@ function App() {
         );
       }
 
-      console.log(
-        "[RoboResearch AI] Retrieved sources:",
-        receivedSources.length
-      );
+      // console.log(
+      //   "[RoboResearch AI] Retrieved sources:",
+      //   receivedSources.length
+      // );
 
       return true;
     }
@@ -949,16 +949,16 @@ function App() {
 
     const startedAt = performance.now();
 
-    console.log("[RoboResearch AI] Streaming request started");
-    console.log("[RoboResearch AI] Selected model:", selectedModel);
-    console.log(
-      "[RoboResearch AI] Attached document ID:",
-      selectedDocument?.id ?? "None"
-    );
-    console.log(
-      "[RoboResearch AI] Attached document:",
-      selectedDocument?.filename ?? "None"
-    );
+    // console.log("[RoboResearch AI] Streaming request started");
+    // console.log("[RoboResearch AI] Selected model:", selectedModel);
+    // console.log(
+    //   "[RoboResearch AI] Attached document ID:",
+    //   selectedDocument?.id ?? "None"
+    // );
+    // console.log(
+    //   "[RoboResearch AI] Attached document:",
+    //   selectedDocument?.filename ?? "None"
+    // );
 
     try {
       let conversationId = activeConversationId;
@@ -1010,10 +1010,10 @@ function App() {
         document_id: selectedDocument?.id ?? null,
       };
 
-      console.log(
-        "[RoboResearch AI] Sending document_id:",
-        requestBody.document_id
-      );
+      // console.log(
+      //   "[RoboResearch AI] Sending document_id:",
+      //   requestBody.document_id
+      // );
 
       const response = await fetch(
         `${API_URL}/api/chat/stream`,
@@ -1206,7 +1206,7 @@ function App() {
 
           <div>
             <h1 className="font-semibold">
-              RoboResearch AI
+              Robo Research
             </h1>
 
             <p className="text-xs text-zinc-500">
@@ -1489,7 +1489,7 @@ function App() {
 
             <div className="min-w-0">
               <h2 className="text-sm font-semibold">
-                RoboResearch AI
+                Robo Research
               </h2>
 
               <p className="truncate text-xs text-zinc-500">
@@ -1838,7 +1838,7 @@ function App() {
                   setInput(event.target.value)
                 }
                 onKeyDown={handleKeyDown}
-                placeholder="Message RoboResearch AI..."
+                placeholder="Message Robo Research"
                 rows={2}
                 disabled={loading}
                 className="max-h-40 w-full resize-none bg-transparent px-2 py-2 text-sm text-zinc-100 outline-none placeholder:text-zinc-500"
@@ -1892,7 +1892,7 @@ function App() {
             </div>
 
             <p className="mt-3 text-center text-xs text-zinc-600">
-              RoboResearch AI can make mistakes. Verify important information.
+              Robo Research can make mistakes. Verify important information.
             </p>
           </div>
         </footer>

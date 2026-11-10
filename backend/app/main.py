@@ -32,7 +32,7 @@ from app.schemas import (
 )
 
 app = FastAPI(
-    title="RoboResearch AI",
+    title="Robo Research",
     description="A personal robotics-focused educational AI assistant.",
     version="0.2.0",
 )
@@ -111,7 +111,7 @@ def parse_chat_messages(
 async def root():
 
     return {
-        "application": "RoboResearch AI",
+        "application": "Robo Research",
         "status": "running",
         "version": "0.2.0",
     }
