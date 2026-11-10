@@ -19,11 +19,8 @@ import {
   MessageSquare,
   Pencil,
   FileText,
-  Upload,
   LoaderCircle,
-  CheckCircle2,
   AlertCircle,
-  Library,
   BookOpen,
   Cpu,
   RefreshCw,
@@ -35,18 +32,7 @@ import {
 // TYPES
 // --------------------------------------------------
 
-type Document = {
-  id: string;
-  filename: string;
-  file_size: number;
-  page_count: number;
-  status: "processing" | "ready" | "failed";
-  error_message?: string | null;
-  created_at: string;
-};
-
 type Source = {
-  document_id: string;
   filename: string;
   page_number: number;
   similarity: number;
@@ -66,11 +52,18 @@ type Conversation = {
   created_at: string;
   updated_at: string;
   message_count: number;
+  messages: Message[];
+};
+
+type StoredData = {
+  conversations: Conversation[];
+  activeConversationId: string | null;
 };
 
 type ModelsResponse = {
   models: string[];
   default_model: string;
+  provider: "groq" | "ollama";
 };
 
 type StreamEvent = {
@@ -94,11 +87,104 @@ const API_URL = (
 ).replace(/\/$/, "");
 
 const DEFAULT_MODEL = "openai/gpt-oss-120b";
+const STORAGE_KEY = "robo-research-ai-conversations-v1";
 
 function isEmbeddingModel(model: string) {
   return /embed|all-minilm|nomic-embed|mxbai|bge-|snowflake-arctic/i.test(
     model
   );
+}
+
+async function responseErrorMessage(
+  response: Response,
+  fallback: string
+): Promise<string> {
+  try {
+    const data: { detail?: unknown } = await response.json();
+    const detail = data.detail;
+
+    if (typeof detail === "string") return detail;
+
+    if (Array.isArray(detail)) {
+      return detail
+        .map((item) => {
+          if (!item || typeof item !== "object") return String(item);
+
+          const issue = item as { loc?: unknown[]; msg?: string };
+          const location = issue.loc?.slice(1).join(" → ");
+          return location ? `${location}: ${issue.msg}` : issue.msg;
+        })
+        .filter(Boolean)
+        .join("; ") || fallback;
+    }
+  } catch {
+    // Use the endpoint-specific fallback when the body is not JSON.
+  }
+
+  return fallback;
+}
+
+function createId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function loadStoredData(): StoredData {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+
+    if (!raw) {
+      return {
+        conversations: [],
+        activeConversationId: null,
+      };
+    }
+
+    const parsed = JSON.parse(raw);
+
+    if (!Array.isArray(parsed.conversations)) {
+      throw new Error("Invalid conversation storage.");
+    }
+
+    const conversations: Conversation[] = parsed.conversations.map(
+      (conversation: Partial<Conversation>) => ({
+        id: conversation.id || createId(),
+        title: conversation.title || "New conversation",
+        created_at: conversation.created_at || new Date().toISOString(),
+        updated_at: conversation.updated_at || new Date().toISOString(),
+        message_count: conversation.message_count || 0,
+        messages: Array.isArray(conversation.messages)
+          ? conversation.messages
+          : [],
+      })
+    );
+
+    const activeConversationId =
+      conversations.some(
+        (conversation) =>
+          conversation.id === parsed.activeConversationId
+      )
+        ? parsed.activeConversationId
+        : null;
+
+    return {
+      conversations,
+      activeConversationId,
+    };
+  } catch (error) {
+    console.error(
+      "[RoboResearch AI] Unable to restore local conversations:",
+      error
+    );
+
+    return {
+      conversations: [],
+      activeConversationId: null,
+    };
+  }
 }
 
 // --------------------------------------------------
@@ -108,17 +194,13 @@ function isEmbeddingModel(model: string) {
 function parseStreamEvents(rawLine: string): StreamEvent[] {
   let line = rawLine.trim();
 
-  if (!line) {
-    return [];
-  }
+  if (!line) return [];
 
   if (line.startsWith("data:")) {
     line = line.slice(5).trim();
   }
 
-  if (!line || line === "[DONE]") {
-    return [];
-  }
+  if (!line || line === "[DONE]") return [];
 
   const events: StreamEvent[] = [];
 
@@ -148,10 +230,7 @@ function parseStreamEvents(rawLine: string): StreamEvent[] {
     }
 
     if (char === "{") {
-      if (depth === 0) {
-        start = i;
-      }
-
+      if (depth === 0) start = i;
       depth++;
       continue;
     }
@@ -166,10 +245,10 @@ function parseStreamEvents(rawLine: string): StreamEvent[] {
       }
 
       if (depth === 0 && start !== -1) {
-        const jsonText = line.slice(start, i + 1);
-
         try {
-          events.push(JSON.parse(jsonText) as StreamEvent);
+          events.push(
+            JSON.parse(line.slice(start, i + 1)) as StreamEvent
+          );
         } catch {
           throw new Error(
             "Unable to parse a streaming event from the server."
@@ -201,7 +280,24 @@ function parseStreamEvents(rawLine: string): StreamEvent[] {
 // --------------------------------------------------
 
 function App() {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [initialData] = useState<StoredData>(loadStoredData);
+
+  const [conversations, setConversations] = useState<Conversation[]>(
+    initialData.conversations
+  );
+
+  const [activeConversationId, setActiveConversationId] =
+    useState<string | null>(initialData.activeConversationId);
+
+  const [messages, setMessages] = useState<Message[]>(() => {
+    const active = initialData.conversations.find(
+      (conversation) =>
+        conversation.id === initialData.activeConversationId
+    );
+
+    return active?.messages ?? [];
+  });
+
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -212,24 +308,80 @@ function App() {
   const [modelsLoading, setModelsLoading] = useState(true);
   const [modelError, setModelError] = useState("");
 
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [activeConversationId, setActiveConversationId] =
-    useState<string | null>(null);
-
-  const [documents, setDocuments] = useState<Document[]>([]);
   const [uploading, setUploading] = useState(false);
   const [documentError, setDocumentError] = useState("");
   const [attachedDocument, setAttachedDocument] =
-    useState<Document | null>(null);
+    useState<File | null>(null);
 
   const chatFileInputRef = useRef<HTMLInputElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const controllerRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef(0);
+
+  // ------------------------------------------------
+  // SAVE CONVERSATIONS TO BROWSER STORAGE
+  // ------------------------------------------------
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({
+          conversations,
+          activeConversationId,
+        } satisfies StoredData)
+      );
+    } catch (error) {
+      console.error(
+        "[RoboResearch AI] Unable to save conversations:",
+        error
+      );
+
+      setError(
+        "Unable to save chat history in this browser. Browser storage may be full or unavailable."
+      );
+    }
+  }, [conversations, activeConversationId]);
+
+  // ------------------------------------------------
+  // SYNC ACTIVE MESSAGES WITH CONVERSATION HISTORY
+  // ------------------------------------------------
+
+  useEffect(() => {
+    if (!activeConversationId) return;
+
+    setConversations((previous) => {
+      const existing = previous.find(
+        (conversation) =>
+          conversation.id === activeConversationId
+      );
+
+      if (!existing) return previous;
+
+      const firstUserMessage = messages.find(
+        (message) => message.role === "user"
+      );
+
+      const title =
+        existing.title === "New conversation" && firstUserMessage
+          ? generateConversationTitle(firstUserMessage.content)
+          : existing.title;
+
+      return previous.map((conversation) =>
+        conversation.id === activeConversationId
+          ? {
+              ...conversation,
+              title,
+              messages,
+              message_count: messages.length,
+              updated_at: new Date().toISOString(),
+            }
+          : conversation
+      );
+    });
+  }, [messages, activeConversationId]);
 
   // ------------------------------------------------
   // SCROLL TO LATEST MESSAGE
@@ -253,16 +405,12 @@ function App() {
       const response = await fetch(`${API_URL}/api/models`);
 
       if (!response.ok) {
-        let message = "Unable to retrieve available models.";
-
-        try {
-          const data = await response.json();
-          message = data.detail || message;
-        } catch {
-          // Keep default error.
-        }
-
-        throw new Error(message);
+        throw new Error(
+          await responseErrorMessage(
+            response,
+            "Unable to retrieve available models."
+          )
+        );
       }
 
       const data: ModelsResponse = await response.json();
@@ -305,471 +453,10 @@ function App() {
   }
 
   // ------------------------------------------------
-  // FETCH CONVERSATIONS
-  // ------------------------------------------------
-
-  async function fetchConversations() {
-    try {
-      const response = await fetch(`${API_URL}/api/conversations`);
-
-      if (!response.ok) {
-        throw new Error("Unable to load saved conversations.");
-      }
-
-      const data = await response.json();
-
-      setConversations(data.conversations ?? []);
-    } catch (err) {
-      console.error(
-        "[RoboResearch AI] Failed to load conversations:",
-        err
-      );
-    }
-  }
-
-  // ------------------------------------------------
-  // CREATE CONVERSATION
-  // ------------------------------------------------
-
-  async function createConversation(
-    title: string,
-    signal: AbortSignal
-  ) {
-    const response = await fetch(`${API_URL}/api/conversations`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ title }),
-      signal,
-    });
-
-    if (!response.ok) {
-      let message = "Unable to create a new conversation.";
-
-      try {
-        const data = await response.json();
-        message = data.detail || message;
-      } catch {
-        // Keep default error.
-      }
-
-      throw new Error(message);
-    }
-
-    return response.json();
-  }
-
-  // ------------------------------------------------
-  // OPEN CONVERSATION
-  // ------------------------------------------------
-
-  async function openConversation(conversationId: string) {
-    if (
-      conversationId === activeConversationId &&
-      !loading
-    ) {
-      return;
-    }
-
-    cancelActiveRequest();
-
-    const requestId = requestIdRef.current;
-    const controller = new AbortController();
-
-    controllerRef.current = controller;
-
-    setLoading(true);
-    setError("");
-    setAttachedDocument(null);
-
-    try {
-      const response = await fetch(
-        `${API_URL}/api/conversations/${conversationId}`,
-        {
-          signal: controller.signal,
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error("Unable to open this conversation.");
-      }
-
-      const data = await response.json();
-
-      if (requestId !== requestIdRef.current) {
-        return;
-      }
-
-      const restoredMessages: Message[] = (
-        data.messages ?? []
-      ).map((message: Message) => ({
-        role: message.role,
-        content: message.content,
-        sources: message.sources ?? [],
-      }));
-
-      setMessages(restoredMessages);
-      setActiveConversationId(conversationId);
-
-      textareaRef.current?.focus();
-    } catch (err) {
-      if (controller.signal.aborted) {
-        return;
-      }
-
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Unable to load this conversation."
-      );
-    } finally {
-      if (requestId === requestIdRef.current) {
-        setLoading(false);
-        controllerRef.current = null;
-      }
-    }
-  }
-
-  // ------------------------------------------------
-  // RENAME CONVERSATION
-  // ------------------------------------------------
-
-  async function renameConversation(conversation: Conversation) {
-    const newTitle = window.prompt(
-      "Enter a new conversation title:",
-      conversation.title
-    );
-
-    if (!newTitle || !newTitle.trim()) {
-      return;
-    }
-
-    try {
-      const response = await fetch(
-        `${API_URL}/api/conversations/${conversation.id}`,
-        {
-          method: "PATCH",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            title: newTitle.trim(),
-          }),
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error("Unable to rename this conversation.");
-      }
-
-      await fetchConversations();
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Unable to rename this conversation."
-      );
-    }
-  }
-
-  // ------------------------------------------------
-  // DELETE CONVERSATION
-  // ------------------------------------------------
-
-  async function deleteConversation(conversationId: string) {
-    const confirmed = window.confirm(
-      "Are you sure you want to delete this conversation? This action cannot be undone."
-    );
-
-    if (!confirmed) {
-      return;
-    }
-
-    try {
-      const response = await fetch(
-        `${API_URL}/api/conversations/${conversationId}`,
-        {
-          method: "DELETE",
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error("Unable to delete this conversation.");
-      }
-
-      if (activeConversationId === conversationId) {
-        cancelActiveRequest();
-
-        setMessages([]);
-        setActiveConversationId(null);
-        setInput("");
-        setAttachedDocument(null);
-      }
-
-      await fetchConversations();
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Unable to delete this conversation."
-      );
-    }
-  }
-
-  // ------------------------------------------------
-  // FETCH DOCUMENTS
-  // ------------------------------------------------
-
-  async function fetchDocuments() {
-    try {
-      const response = await fetch(`${API_URL}/api/documents`);
-
-      if (!response.ok) {
-        throw new Error("Unable to load documents.");
-      }
-
-      const data = await response.json();
-
-      setDocuments(data.documents ?? []);
-    } catch (err) {
-      console.error(
-        "[RoboResearch AI] Failed to load documents:",
-        err
-      );
-    }
-  }
-
-  // ------------------------------------------------
-  // SELECT A LIBRARY DOCUMENT FOR CHAT
-  // ------------------------------------------------
-
-  function selectDocumentForChat(document: Document) {
-    if (document.status !== "ready") {
-      setDocumentError(
-        "This PDF is not ready yet. Please wait until processing is complete."
-      );
-      return;
-    }
-
-    setAttachedDocument(document);
-    setDocumentError("");
-
-    textareaRef.current?.focus();
-
-    console.log(
-      "[RoboResearch AI] Document selected for chat:",
-      document.id,
-      document.filename
-    );
-  }
-
-  // ------------------------------------------------
-  // UPLOAD PDF AND RETURN DOCUMENT DETAILS
-  // ------------------------------------------------
-
-  async function uploadPdf(file: File): Promise<Document> {
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
-      throw new Error("Please select a PDF file.");
-    }
-
-    const formData = new FormData();
-    formData.append("file", file);
-
-    const response = await fetch(
-      `${API_URL}/api/documents/upload`,
-      {
-        method: "POST",
-        body: formData,
-      }
-    );
-
-    let data: {
-      document?: Document;
-      detail?: string;
-    };
-
-    try {
-      data = await response.json();
-    } catch {
-      throw new Error(
-        "The server returned an invalid upload response."
-      );
-    }
-
-    if (!response.ok) {
-      throw new Error(
-        data.detail || "Unable to upload this document."
-      );
-    }
-
-    if (!data.document?.id) {
-      throw new Error(
-        "The server uploaded the PDF but did not return a valid document ID."
-      );
-    }
-
-    return data.document;
-  }
-
-  // ------------------------------------------------
-  // ATTACH PDF DIRECTLY TO CHAT
-  // ------------------------------------------------
-
-  async function attachDocumentToChat(file: File) {
-    setUploading(true);
-    setDocumentError("");
-
-    try {
-      const uploaded = await uploadPdf(file);
-
-      if (uploaded.status !== "ready") {
-        throw new Error(
-          uploaded.error_message ||
-            "The PDF has not finished processing."
-        );
-      }
-
-      setAttachedDocument(uploaded);
-
-      await fetchDocuments();
-
-      console.log(
-        "[RoboResearch AI] PDF attached to chat:",
-        uploaded.id,
-        uploaded.filename
-      );
-    } catch (err) {
-      setDocumentError(
-        err instanceof Error
-          ? err.message
-          : "Document upload failed."
-      );
-    } finally {
-      setUploading(false);
-
-      if (chatFileInputRef.current) {
-        chatFileInputRef.current.value = "";
-      }
-    }
-  }
-
-  // ------------------------------------------------
-  // UPLOAD PDF TO RESEARCH LIBRARY
-  // ------------------------------------------------
-
-  async function uploadDocument(file: File) {
-    setUploading(true);
-    setDocumentError("");
-
-    try {
-      const uploaded = await uploadPdf(file);
-
-      // IMPORTANT:
-      // A PDF uploaded through the Research Library
-      // is now also attached to the current chat.
-      if (uploaded.status === "ready") {
-        setAttachedDocument(uploaded);
-
-        console.log(
-          "[RoboResearch AI] Library PDF automatically attached:",
-          uploaded.id,
-          uploaded.filename
-        );
-      } else {
-        setDocumentError(
-          uploaded.error_message ||
-            "The PDF was uploaded but is not ready for chat yet."
-        );
-      }
-
-      await fetchDocuments();
-    } catch (err) {
-      setDocumentError(
-        err instanceof Error
-          ? err.message
-          : "Document upload failed."
-      );
-    } finally {
-      setUploading(false);
-
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
-    }
-  }
-
-  // ------------------------------------------------
-  // DELETE DOCUMENT
-  // ------------------------------------------------
-
-  async function deleteDocument(documentId: string) {
-    const confirmed = window.confirm(
-      "Are you sure you want to delete this document? Its extracted text and embeddings will also be removed."
-    );
-
-    if (!confirmed) {
-      return;
-    }
-
-    try {
-      const response = await fetch(
-        `${API_URL}/api/documents/${documentId}`,
-        {
-          method: "DELETE",
-        }
-      );
-
-      if (!response.ok) {
-        let message = "Unable to delete this document.";
-
-        try {
-          const data = await response.json();
-          message = data.detail || message;
-        } catch {
-          // Keep default error.
-        }
-
-        throw new Error(message);
-      }
-
-      if (attachedDocument?.id === documentId) {
-        setAttachedDocument(null);
-      }
-
-      await fetchDocuments();
-    } catch (err) {
-      setDocumentError(
-        err instanceof Error
-          ? err.message
-          : "Unable to delete this document."
-      );
-    }
-  }
-
-  // ------------------------------------------------
-  // FORMAT FILE SIZE
-  // ------------------------------------------------
-
-  function formatFileSize(bytes: number) {
-    if (bytes < 1024) {
-      return `${bytes} B`;
-    }
-
-    if (bytes < 1024 * 1024) {
-      return `${(bytes / 1024).toFixed(1)} KB`;
-    }
-
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  }
-
-  // ------------------------------------------------
   // INITIAL DATA LOADING
   // ------------------------------------------------
 
   useEffect(() => {
-    void fetchConversations();
-    void fetchDocuments();
     void fetchModels();
   }, []);
 
@@ -793,11 +480,152 @@ function App() {
   function generateConversationTitle(content: string) {
     const cleaned = content.replace(/\s+/g, " ").trim();
 
-    if (cleaned.length <= 55) {
-      return cleaned;
-    }
+    if (cleaned.length <= 55) return cleaned;
 
     return cleaned.slice(0, 55).trimEnd() + "...";
+  }
+
+  // ------------------------------------------------
+  // CREATE LOCAL CONVERSATION
+  // ------------------------------------------------
+
+  function createLocalConversation(): string {
+    const id = createId();
+    const now = new Date().toISOString();
+
+    const conversation: Conversation = {
+      id,
+      title: "New conversation",
+      created_at: now,
+      updated_at: now,
+      message_count: 0,
+      messages: [],
+    };
+
+    setConversations((previous) => [
+      conversation,
+      ...previous,
+    ]);
+
+    setActiveConversationId(id);
+
+    return id;
+  }
+
+  // ------------------------------------------------
+  // OPEN LOCAL CONVERSATION
+  // ------------------------------------------------
+
+  function openConversation(conversationId: string) {
+    if (
+      conversationId === activeConversationId &&
+      !loading
+    ) {
+      return;
+    }
+
+    cancelActiveRequest();
+
+    const conversation = conversations.find(
+      (item) => item.id === conversationId
+    );
+
+    if (!conversation) {
+      setError("This conversation could not be found in browser storage.");
+      return;
+    }
+
+    setMessages(conversation.messages ?? []);
+    setActiveConversationId(conversationId);
+
+    setInput("");
+    setError("");
+    setAttachedDocument(null);
+    setDocumentError("");
+
+    textareaRef.current?.focus();
+  }
+
+  // ------------------------------------------------
+  // RENAME LOCAL CONVERSATION
+  // ------------------------------------------------
+
+  function renameConversation(conversation: Conversation) {
+    const newTitle = window.prompt(
+      "Enter a new conversation title:",
+      conversation.title
+    );
+
+    if (!newTitle || !newTitle.trim()) return;
+
+    setConversations((previous) =>
+      previous.map((item) =>
+        item.id === conversation.id
+          ? {
+              ...item,
+              title: newTitle.trim(),
+              updated_at: new Date().toISOString(),
+            }
+          : item
+      )
+    );
+  }
+
+  // ------------------------------------------------
+  // DELETE LOCAL CONVERSATION
+  // ------------------------------------------------
+
+  function deleteConversation(conversationId: string) {
+    const confirmed = window.confirm(
+      "Are you sure you want to delete this conversation? This action cannot be undone."
+    );
+
+    if (!confirmed) return;
+
+    if (activeConversationId === conversationId) {
+      cancelActiveRequest();
+
+      setMessages([]);
+      setActiveConversationId(null);
+      setInput("");
+      setAttachedDocument(null);
+    }
+
+    setConversations((previous) =>
+      previous.filter((item) => item.id !== conversationId)
+    );
+  }
+
+  // ------------------------------------------------
+  // ATTACH PDF FOR IN-MEMORY CHAT PROCESSING
+  // ------------------------------------------------
+
+  async function attachDocumentToChat(file: File) {
+    setUploading(true);
+    setDocumentError("");
+
+    try {
+      if (!file.name.toLowerCase().endsWith(".pdf")) {
+        throw new Error("Please select a PDF file.");
+      }
+
+      if (file.size > 20 * 1024 * 1024) {
+        throw new Error("PDF exceeds the 20 MB size limit.");
+      }
+
+      setAttachedDocument(file);
+      textareaRef.current?.focus();
+    } catch (err) {
+      setDocumentError(
+        err instanceof Error ? err.message : "Unable to attach this PDF."
+      );
+    } finally {
+      setUploading(false);
+
+      if (chatFileInputRef.current) {
+        chatFileInputRef.current.value = "";
+      }
+    }
   }
 
   // ------------------------------------------------
@@ -810,9 +638,7 @@ function App() {
     assistantIndex: number,
     startedAt: number
   ) {
-    if (requestId !== requestIdRef.current) {
-      return false;
-    }
+    if (requestId !== requestIdRef.current) return false;
 
     if (event.type === "token") {
       setMessages((previous) =>
@@ -872,12 +698,6 @@ function App() {
         )
       );
 
-      if (wasTruncated) {
-        console.warn(
-          "[RoboResearch AI] Response reached the output token limit."
-        );
-      }
-
       console.log(
         "[RoboResearch AI] Retrieved sources:",
         receivedSources.length
@@ -906,37 +726,23 @@ function App() {
     const content =
       input.trim() ||
       (attachedDocument
-        ? `Please analyze the attached research paper: ${attachedDocument.filename}`
+        ? `Please analyze the attached research paper: ${attachedDocument.name}`
         : "");
 
-    if (!content || loading) {
-      return;
-    }
+    if (!content || loading) return;
 
     if (!selectedModel) {
       setError("Please select an available AI model.");
       return;
     }
 
-    if (
-      attachedDocument &&
-      attachedDocument.status !== "ready"
-    ) {
-      setError(
-        "The attached PDF is not ready yet. Please wait for processing to finish."
-      );
-      return;
-    }
-
-    const selectedDocument = attachedDocument;
-
     const userMessage: Message = {
       role: "user",
       content,
     };
 
-    const conversation = [...messages, userMessage];
-    const assistantIndex = conversation.length;
+    const conversationMessages = [...messages, userMessage];
+    const assistantIndex = conversationMessages.length;
 
     const requestId = ++requestIdRef.current;
     const controller = new AbortController();
@@ -952,46 +758,21 @@ function App() {
     console.log("[RoboResearch AI] Streaming request started");
     console.log("[RoboResearch AI] Selected model:", selectedModel);
     console.log(
-      "[RoboResearch AI] Attached document ID:",
-      selectedDocument?.id ?? "None"
-    );
-    console.log(
-      "[RoboResearch AI] Attached document:",
-      selectedDocument?.filename ?? "None"
+      "[RoboResearch AI] Attached PDF:",
+      attachedDocument?.name ?? "None"
     );
 
     try {
-      let conversationId = activeConversationId;
+      let localConversationId = activeConversationId;
 
-      if (!conversationId) {
-        const created = await createConversation(
-          generateConversationTitle(content),
-          controller.signal
-        );
-
-        if (requestId !== requestIdRef.current) {
-          return;
-        }
-
-        conversationId = created.id;
-
-        if (!conversationId) {
-          throw new Error(
-            "The backend did not return a conversation ID."
-          );
-        }
-
-        setActiveConversationId(conversationId);
-
-        void fetchConversations();
+      if (!localConversationId) {
+        localConversationId = createLocalConversation();
       }
 
-      if (requestId !== requestIdRef.current) {
-        return;
-      }
+      if (requestId !== requestIdRef.current) return;
 
       setMessages([
-        ...conversation,
+        ...conversationMessages,
         {
           role: "assistant",
           content: "",
@@ -1000,45 +781,32 @@ function App() {
         },
       ]);
 
-      const requestBody = {
-        conversation_id: conversationId,
-        messages: conversation,
-        model: selectedModel,
+      // No conversation_id is sent.
+      // The backend does not need to save conversation history.
+      const requestBody = new FormData();
+      requestBody.append("messages", JSON.stringify(conversationMessages));
+      requestBody.append("model", selectedModel);
 
-        // The selected PDF ID is explicitly sent
-        // with every chat request.
-        document_id: selectedDocument?.id ?? null,
-      };
-
-      console.log(
-        "[RoboResearch AI] Sending document_id:",
-        requestBody.document_id
-      );
+      if (attachedDocument) {
+        requestBody.append("file", attachedDocument);
+      }
 
       const response = await fetch(
         `${API_URL}/api/chat/stream`,
         {
           method: "POST",
           headers: {
-            "Content-Type": "application/json",
             Accept: "application/x-ndjson",
           },
-          body: JSON.stringify(requestBody),
+          body: requestBody,
           signal: controller.signal,
         }
       );
 
       if (!response.ok) {
-        let errorMessage = "Something went wrong.";
-
-        try {
-          const data = await response.json();
-          errorMessage = data.detail || errorMessage;
-        } catch {
-          // Keep default error.
-        }
-
-        throw new Error(errorMessage);
+        throw new Error(
+          await responseErrorMessage(response, "Chat request failed.")
+        );
       }
 
       if (!response.body) {
@@ -1064,9 +832,7 @@ function App() {
             startedAt
           );
 
-          if (completed) {
-            receivedDone = true;
-          }
+          if (completed) receivedDone = true;
         }
       }
 
@@ -1074,13 +840,9 @@ function App() {
         while (true) {
           const { value, done } = await reader.read();
 
-          if (done) {
-            break;
-          }
+          if (done) break;
 
-          if (requestId !== requestIdRef.current) {
-            break;
-          }
+          if (requestId !== requestIdRef.current) break;
 
           buffer += decoder.decode(value, {
             stream: true,
@@ -1090,10 +852,7 @@ function App() {
           buffer = lines.pop() ?? "";
 
           for (const line of lines) {
-            if (requestId !== requestIdRef.current) {
-              break;
-            }
-
+            if (requestId !== requestIdRef.current) break;
             processLine(line);
           }
         }
@@ -1119,28 +878,26 @@ function App() {
         reader.releaseLock();
       }
 
-      if (
-        receivedDone &&
-        requestId === requestIdRef.current
-      ) {
-        // Detach after a successful response.
-        setAttachedDocument(null);
-
-        void fetchConversations();
-      }
     } catch (err) {
-      if (controller.signal.aborted) {
-        return;
-      }
+      if (controller.signal.aborted) return;
 
       console.error(
         "[RoboResearch AI] Streaming failed:",
         err
       );
 
+      setMessages((previous) =>
+        previous.filter(
+          (message, index) =>
+            index !== assistantIndex ||
+            message.role !== "assistant" ||
+            Boolean(message.content)
+        )
+      );
+
       setError(
         err instanceof Error
-          ? `${err.name}: ${err.message}`
+          ? err.message
           : "Unable to connect to RoboResearch AI."
       );
     } finally {
@@ -1177,10 +934,7 @@ function App() {
   function handleKeyDown(
     event: KeyboardEvent<HTMLTextAreaElement>
   ) {
-    if (
-      event.key === "Enter" &&
-      !event.shiftKey
-    ) {
+    if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void sendMessage();
     }
@@ -1198,24 +952,19 @@ function App() {
           sidebarOpen ? "flex" : "hidden"
         } w-72 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900/80 p-4`}
       >
-        {/* BRAND */}
         <div className="mb-8 flex items-center gap-3 px-2">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-600">
             <Bot size={23} />
           </div>
 
           <div>
-            <h1 className="font-semibold">
-              RoboResearch AI
-            </h1>
-
+            <h1 className="font-semibold">RoboResearch AI</h1>
             <p className="text-xs text-zinc-500">
               Your robotics assistant
             </p>
           </div>
         </div>
 
-        {/* NEW CHAT */}
         <button
           onClick={newChat}
           className="flex items-center gap-3 rounded-xl border border-zinc-700 px-4 py-3 text-sm transition hover:bg-zinc-800"
@@ -1243,7 +992,7 @@ function App() {
                 >
                   <button
                     onClick={() =>
-                      void openConversation(conversation.id)
+                      openConversation(conversation.id)
                     }
                     className="flex min-w-0 flex-1 items-center gap-2 text-left"
                     title={conversation.title}
@@ -1259,9 +1008,7 @@ function App() {
                   </button>
 
                   <button
-                    onClick={() =>
-                      void renameConversation(conversation)
-                    }
+                    onClick={() => renameConversation(conversation)}
                     className="shrink-0 text-zinc-500 opacity-0 transition hover:text-blue-400 group-hover:opacity-100"
                     title="Rename conversation"
                   >
@@ -1270,7 +1017,7 @@ function App() {
 
                   <button
                     onClick={() =>
-                      void deleteConversation(conversation.id)
+                      deleteConversation(conversation.id)
                     }
                     className="shrink-0 text-zinc-500 opacity-0 transition hover:text-red-400 group-hover:opacity-100"
                     title="Delete conversation"
@@ -1287,184 +1034,10 @@ function App() {
           )}
         </div>
 
-        {/* RESEARCH LIBRARY */}
-        <div className="mt-6 min-h-0 flex-1 overflow-y-auto">
-          <div className="mb-3 flex items-center justify-between px-2">
-            <div className="flex items-center gap-2">
-              <Library
-                size={15}
-                className="text-blue-400"
-              />
-
-              <p className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
-                Research Library
-              </p>
-            </div>
-
-            <span className="text-xs text-zinc-500">
-              {documents.length}
-            </span>
-          </div>
-
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".pdf,application/pdf"
-            className="hidden"
-            onChange={(event) => {
-              const file = event.target.files?.[0];
-
-              if (file) {
-                void uploadDocument(file);
-              }
-            }}
-          />
-
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={uploading}
-            className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-zinc-700 px-3 py-3 text-sm text-zinc-300 transition hover:border-blue-500 hover:bg-blue-500/5 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {uploading ? (
-              <LoaderCircle
-                size={17}
-                className="animate-spin"
-              />
-            ) : (
-              <Upload size={17} />
-            )}
-
-            {uploading
-              ? "Processing PDF..."
-              : "Upload research paper"}
-          </button>
-
-          {documentError && (
-            <div className="mb-3 rounded-lg border border-red-900 bg-red-950/30 p-2 text-xs text-red-300">
-              {documentError}
-            </div>
-          )}
-
-          {documents.length > 0 ? (
-            <div className="space-y-2">
-              {documents.map((document) => {
-                const isAttached =
-                  attachedDocument?.id === document.id;
-
-                return (
-                  <div
-                    key={document.id}
-                    className={`group rounded-lg border p-3 ${
-                      isAttached
-                        ? "border-blue-700/70 bg-blue-950/20"
-                        : "border-zinc-800 bg-zinc-950/60"
-                    }`}
-                  >
-                    <div className="flex items-start gap-2">
-                      <FileText
-                        size={17}
-                        className="mt-0.5 shrink-0 text-blue-400"
-                      />
-
-                      <div className="min-w-0 flex-1">
-                        <p
-                          className="truncate text-xs font-medium text-zinc-300"
-                          title={document.filename}
-                        >
-                          {document.filename}
-                        </p>
-
-                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                          {document.status === "ready" && (
-                            <span className="flex items-center gap-1 text-emerald-400">
-                              <CheckCircle2 size={12} />
-                              Ready
-                            </span>
-                          )}
-
-                          {document.status === "processing" && (
-                            <span className="flex items-center gap-1 text-amber-400">
-                              <LoaderCircle
-                                size={12}
-                                className="animate-spin"
-                              />
-                              Processing
-                            </span>
-                          )}
-
-                          {document.status === "failed" && (
-                            <span
-                              className="flex items-center gap-1 text-red-400"
-                              title={
-                                document.error_message ||
-                                "Processing failed"
-                              }
-                            >
-                              <AlertCircle size={12} />
-                              Failed
-                            </span>
-                          )}
-
-                          <span className="text-zinc-600">
-                            {formatFileSize(document.file_size)}
-                          </span>
-
-                          <span className="text-zinc-600">
-                            {document.page_count} pages
-                          </span>
-                        </div>
-
-                        {/* SELECT DOCUMENT FOR CHAT */}
-                        <button
-                          type="button"
-                          onClick={() =>
-                            selectDocumentForChat(document)
-                          }
-                          disabled={
-                            document.status !== "ready" ||
-                            uploading ||
-                            loading
-                          }
-                          className={`mt-3 rounded-md px-2.5 py-1.5 text-xs transition disabled:cursor-not-allowed disabled:opacity-40 ${
-                            isAttached
-                              ? "bg-blue-600/20 text-blue-300"
-                              : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white"
-                          }`}
-                        >
-                          {isAttached
-                            ? "Selected for chat"
-                            : "Use in chat"}
-                        </button>
-                      </div>
-
-                      <button
-                        onClick={() =>
-                          void deleteDocument(document.id)
-                        }
-                        className="shrink-0 text-zinc-600 opacity-0 transition hover:text-red-400 group-hover:opacity-100"
-                        title="Delete document"
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ) : (
-            <p className="px-2 py-3 text-center text-xs text-zinc-600">
-              No research papers uploaded yet.
-            </p>
-          )}
-        </div>
-
         {/* CLOUD AI STATUS */}
         <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-950 p-4">
           <div className="mb-2 flex items-center gap-2 text-sm">
-            <Sparkles
-              size={16}
-              className="text-blue-400"
-            />
+            <Sparkles size={16} className="text-blue-400" />
             Cloud AI
           </div>
 
@@ -1501,10 +1074,7 @@ function App() {
           {/* MODEL SELECTOR */}
           <div className="flex shrink-0 items-center gap-2">
             <div className="flex items-center gap-2 rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2">
-              <Cpu
-                size={16}
-                className="shrink-0 text-blue-400"
-              />
+              <Cpu size={16} className="shrink-0 text-blue-400" />
 
               <select
                 value={selectedModel}
@@ -1546,9 +1116,7 @@ function App() {
               >
                 <RefreshCw
                   size={14}
-                  className={
-                    modelsLoading ? "animate-spin" : ""
-                  }
+                  className={modelsLoading ? "animate-spin" : ""}
                 />
               </button>
             </div>
@@ -1563,10 +1131,7 @@ function App() {
         {modelError && (
           <div className="flex items-center justify-between gap-3 border-b border-amber-900/50 bg-amber-950/20 px-5 py-2">
             <p className="text-xs text-amber-300">
-              <AlertCircle
-                size={13}
-                className="mr-2 inline"
-              />
+              <AlertCircle size={13} className="mr-2 inline" />
               {modelError}
             </p>
 
@@ -1593,9 +1158,9 @@ function App() {
                 </h2>
 
                 <p className="mb-10 max-w-lg text-sm leading-relaxed text-zinc-500">
-                  Ask me about robotics, control systems,
-                  dynamics, motion planning, machine learning,
-                  UAVs, spacecraft, or anything else.
+                  Ask me about robotics, control systems, dynamics,
+                  motion planning, machine learning, UAVs, spacecraft,
+                  or anything else.
                 </p>
 
                 <div className="grid w-full gap-3 sm:grid-cols-2">
@@ -1618,10 +1183,7 @@ function App() {
             ) : (
               <div className="space-y-8">
                 {messages.map((message, index) => (
-                  <div
-                    key={index}
-                    className="flex gap-4"
-                  >
+                  <div key={index} className="flex gap-4">
                     <div
                       className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${
                         message.role === "assistant"
@@ -1713,7 +1275,7 @@ function App() {
                               {message.sources.map(
                                 (source, sourceIndex) => (
                                   <div
-                                    key={`${source.document_id}-${source.page_number}-${sourceIndex}`}
+                                    key={`${source.filename}-${source.page_number}-${sourceIndex}`}
                                     className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-3"
                                   >
                                     <div className="flex items-start gap-3">
@@ -1759,7 +1321,7 @@ function App() {
 
                             <p className="mt-3 text-xs leading-relaxed text-zinc-600">
                               These passages were retrieved from your
-                              uploaded documents and supplied to the AI
+                              attached PDF and supplied to the AI
                               as reference material. They are not
                               necessarily all explicitly used in the answer.
                             </p>
@@ -1786,7 +1348,6 @@ function App() {
         <footer className="shrink-0 px-4 pb-6 pt-3">
           <div className="mx-auto max-w-3xl">
             <div className="rounded-2xl border border-zinc-700 bg-zinc-900 p-3 shadow-lg focus-within:border-zinc-500">
-              {/* HIDDEN PDF INPUT */}
               <input
                 ref={chatFileInputRef}
                 type="file"
@@ -1794,24 +1355,24 @@ function App() {
                 className="hidden"
                 onChange={(event) => {
                   const file = event.target.files?.[0];
-
-                  if (file) {
-                    void attachDocumentToChat(file);
-                  }
+                  if (file) void attachDocumentToChat(file);
                 }}
               />
+
+              {documentError && (
+                <div className="mb-2 rounded-lg border border-red-900 bg-red-950/30 p-2 text-xs text-red-300">
+                  {documentError}
+                </div>
+              )}
 
               {/* ATTACHED DOCUMENT */}
               {attachedDocument && (
                 <div className="mb-2 flex items-center justify-between rounded-lg border border-blue-900/70 bg-blue-950/30 px-3 py-2">
                   <div className="flex min-w-0 items-center gap-2 text-sm text-blue-200">
-                    <FileText
-                      size={16}
-                      className="shrink-0"
-                    />
+                    <FileText size={16} className="shrink-0" />
 
                     <span className="truncate">
-                      {attachedDocument.filename}
+                      {attachedDocument.name}
                     </span>
 
                     <span className="shrink-0 text-xs text-blue-400">
@@ -1830,13 +1391,10 @@ function App() {
                 </div>
               )}
 
-              {/* TEXT INPUT */}
               <textarea
                 ref={textareaRef}
                 value={input}
-                onChange={(event) =>
-                  setInput(event.target.value)
-                }
+                onChange={(event) => setInput(event.target.value)}
                 onKeyDown={handleKeyDown}
                 placeholder="Message RoboResearch AI..."
                 rows={2}
@@ -1844,7 +1402,6 @@ function App() {
                 className="max-h-40 w-full resize-none bg-transparent px-2 py-2 text-sm text-zinc-100 outline-none placeholder:text-zinc-500"
               />
 
-              {/* COMPOSER ACTIONS */}
               <div className="flex items-center justify-between px-2 pt-2">
                 <div className="flex items-center gap-3">
                   <button
@@ -1865,9 +1422,7 @@ function App() {
                       <Paperclip size={16} />
                     )}
 
-                    {uploading
-                      ? "Uploading PDF..."
-                      : "Attach PDF"}
+                    {uploading ? "Checking PDF..." : "Attach PDF"}
                   </button>
 
                   <p className="text-xs text-zinc-600">

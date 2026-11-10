@@ -1,1 +1,10 @@
 AI_chatbot.pdf
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.tmp
+*.temp

@@ -1,10 +1,15 @@
 # Environment variables
 .env
 .env.*
+!.env.example
 
 # Python virtual environment
 .venv/
 venv/
+*.tmp
+*.temp
+.pytest_cache/
+.ruff_cache/
 
 # Python cache
 __pycache__/
@@ -18,4 +23,6 @@ __pycache__/
 # Uploaded files and temporary files
 uploads/
 temp/
+tmp/
+data/
 robo_research_db
